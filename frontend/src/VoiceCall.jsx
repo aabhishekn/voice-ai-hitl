@@ -1,11 +1,11 @@
 import React, { useRef, useState } from "react";
-import { connect, createLocalAudioTrack, RoomEvent } from "livekit-client";
+import { Room, RoomEvent, createLocalAudioTrack } from "livekit-client";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000";
 
 function speak(text) {
   const msg = new SpeechSynthesisUtterance(text);
-  window.speechSynthesis.cancel(); // stop any previous speech
+  window.speechSynthesis.cancel();
   window.speechSynthesis.speak(msg);
 }
 
@@ -26,11 +26,15 @@ export default function VoiceCall() {
       const { url, token, error } = await r.json();
       if (error) throw new Error(error);
 
-      const room = await connect(url, token);
+      const room = new Room();
+      await room.connect(url, token);
       roomRef.current = room;
 
       room.on(RoomEvent.ParticipantConnected, (p) => console.log("participant connected:", p.identity));
-      room.on(RoomEvent.Disconnected, () => { console.log("disconnected"); setConnected(false); });
+      room.on(RoomEvent.Disconnected, () => {
+        console.log("disconnected");
+        setConnected(false);
+      });
 
       // publish microphone
       const mic = await createLocalAudioTrack();
@@ -39,13 +43,16 @@ export default function VoiceCall() {
       setConnected(true);
     } catch (e) {
       console.error(e);
-      alert("Failed to join LiveKit room. Check backend/.env and restart backend.");
+      alert("Failed to join LiveKit room. Check backend/.env (wss URL, API key/secret) and restart backend.");
     }
   }
 
   function leaveRoom() {
-    roomRef.current?.disconnect();
-    setConnected(false);
+    try {
+      roomRef.current?.disconnect();
+    } finally {
+      setConnected(false);
+    }
   }
 
   function startSTT() {
@@ -73,7 +80,6 @@ export default function VoiceCall() {
         if (resp.status === "answered") {
           speak(resp.answer);
         } else if (resp.status === "escalated") {
-          // exact phrase required by the PDF is provided by backend
           speak(resp.message);
         } else {
           speak("Sorry, something went wrong.");
