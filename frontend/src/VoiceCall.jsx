@@ -2,28 +2,36 @@ import React, { useEffect, useRef, useState } from "react";
 import { Room, RoomEvent, createLocalAudioTrack } from "livekit-client";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000";
-const PERSIST_KEY = "frontdesk:lastPendingId";
+const PERSIST_PENDING_KEY = "frontdesk:lastPendingId";
+const IDENT_KEY = "frontdesk:identity";
 
 function speak(text) {
   const msg = new SpeechSynthesisUtterance(text);
+  // cancel any ongoing speech so the new reply isn't queued far behind
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(msg);
 }
 
 export default function VoiceCall() {
   const [connected, setConnected] = useState(false);
-  const [identity, setIdentity] = useState(() => `caller-${Math.floor(Math.random() * 10000)}`);
+  const [identity, setIdentity] = useState(() => {
+    return localStorage.getItem(IDENT_KEY) || `caller-${Math.floor(Math.random() * 10000)}`;
+  });
   const [transcript, setTranscript] = useState("");
   const roomRef = useRef(null);
   const recRef = useRef(null);
 
-  // Track last escalated request (persist in localStorage)
+  // Track last escalated request (persisted across tab switches)
   const [lastPendingId, setLastPendingId] = useState(() => {
-    return localStorage.getItem(PERSIST_KEY) || null;
+    return localStorage.getItem(PERSIST_PENDING_KEY) || null;
   });
   const pollRef = useRef(null);
 
-  // Join LiveKit
+  // persist identity if user edits it
+  useEffect(() => {
+    if (identity) localStorage.setItem(IDENT_KEY, identity);
+  }, [identity]);
+
   async function joinRoom() {
     try {
       const r = await fetch(`${API_BASE}/api/livekit-token`, {
@@ -42,8 +50,10 @@ export default function VoiceCall() {
       room.on(RoomEvent.Disconnected, () => {
         console.log("disconnected");
         setConnected(false);
+        stopPolling();
       });
 
+      // publish microphone
       const mic = await createLocalAudioTrack();
       await room.localParticipant.publishTrack(mic);
 
@@ -66,13 +76,13 @@ export default function VoiceCall() {
   // Persist lastPendingId whenever it changes
   useEffect(() => {
     if (lastPendingId) {
-      localStorage.setItem(PERSIST_KEY, lastPendingId);
+      localStorage.setItem(PERSIST_PENDING_KEY, lastPendingId);
     } else {
-      localStorage.removeItem(PERSIST_KEY);
+      localStorage.removeItem(PERSIST_PENDING_KEY);
     }
   }, [lastPendingId]);
 
-  // Poll for supervisor follow-up on pending request
+  // Poll for supervisor follow-up on any pending request
   useEffect(() => {
     if (!lastPendingId) return;
     if (pollRef.current) return;
@@ -82,7 +92,7 @@ export default function VoiceCall() {
         const resp = await fetch(`${API_BASE}/api/help-requests`).then((r) => r.json());
         const list = resp.items || [];
         const item = list.find((it) => it.id === lastPendingId);
-        if (!item) return; // might have been cleared by server restart
+        if (!item) return; // possibly cleared by server restart
 
         if (item.status === "resolved" && item.answer) {
           speak(item.answer);               // proactive follow-up
@@ -98,7 +108,7 @@ export default function VoiceCall() {
     }
 
     pollRef.current = setInterval(checkFollowup, 2000);
-    // run once immediately to be snappy
+    // run once immediately so user doesn't wait for first interval
     checkFollowup();
 
     return () => stopPolling();
@@ -136,10 +146,10 @@ export default function VoiceCall() {
         if (resp.status === "answered") {
           speak(resp.answer);
         } else if (resp.status === "escalated") {
-          // required escalation phrase
+          // required escalation phrase from the PDF
           speak(resp.message);
           if (resp.requestId) {
-            setLastPendingId(resp.requestId); // persists to localStorage via effect
+            setLastPendingId(resp.requestId); // persist via effect
           }
         } else {
           speak("Sorry, something went wrong.");
