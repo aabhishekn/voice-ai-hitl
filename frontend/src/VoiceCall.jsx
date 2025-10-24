@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Room, RoomEvent, createLocalAudioTrack } from "livekit-client";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000";
+const PERSIST_KEY = "frontdesk:lastPendingId";
 
 function speak(text) {
   const msg = new SpeechSynthesisUtterance(text);
@@ -16,10 +17,13 @@ export default function VoiceCall() {
   const roomRef = useRef(null);
   const recRef = useRef(null);
 
-  // NEW: track last escalated request to wait for supervisor response
-  const [lastPendingId, setLastPendingId] = useState(null);
+  // Track last escalated request (persist in localStorage)
+  const [lastPendingId, setLastPendingId] = useState(() => {
+    return localStorage.getItem(PERSIST_KEY) || null;
+  });
   const pollRef = useRef(null);
 
+  // Join LiveKit
   async function joinRoom() {
     try {
       const r = await fetch(`${API_BASE}/api/livekit-token`, {
@@ -55,15 +59,20 @@ export default function VoiceCall() {
       roomRef.current?.disconnect();
     } finally {
       setConnected(false);
-      setLastPendingId(null);
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
+      stopPolling();
     }
   }
 
-  // NEW: poll for supervisor follow-up on a pending request
+  // Persist lastPendingId whenever it changes
+  useEffect(() => {
+    if (lastPendingId) {
+      localStorage.setItem(PERSIST_KEY, lastPendingId);
+    } else {
+      localStorage.removeItem(PERSIST_KEY);
+    }
+  }, [lastPendingId]);
+
+  // Poll for supervisor follow-up on pending request
   useEffect(() => {
     if (!lastPendingId) return;
     if (pollRef.current) return;
@@ -73,18 +82,15 @@ export default function VoiceCall() {
         const resp = await fetch(`${API_BASE}/api/help-requests`).then((r) => r.json());
         const list = resp.items || [];
         const item = list.find((it) => it.id === lastPendingId);
-        if (item && item.status === "resolved" && item.answer) {
-          // Speak the supervisor's answer immediately
-          speak(item.answer);
+        if (!item) return; // might have been cleared by server restart
+
+        if (item.status === "resolved" && item.answer) {
+          speak(item.answer);               // proactive follow-up
           setLastPendingId(null);
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
-        // If it becomes unresolved, stop polling too
-        if (item && item.status === "unresolved") {
-          setLastPendingId(null);
-          clearInterval(pollRef.current);
-          pollRef.current = null;
+          stopPolling();
+        } else if (item.status === "unresolved") {
+          setLastPendingId(null);           // give up waiting
+          stopPolling();
         }
       } catch (e) {
         console.error("follow-up poll failed", e);
@@ -92,13 +98,18 @@ export default function VoiceCall() {
     }
 
     pollRef.current = setInterval(checkFollowup, 2000);
-    return () => {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-    };
+    // run once immediately to be snappy
+    checkFollowup();
+
+    return () => stopPolling();
   }, [lastPendingId]);
+
+  function stopPolling() {
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }
 
   function startSTT() {
     if (!("webkitSpeechRecognition" in window)) {
@@ -125,10 +136,10 @@ export default function VoiceCall() {
         if (resp.status === "answered") {
           speak(resp.answer);
         } else if (resp.status === "escalated") {
-          speak(resp.message); // required escalation phrase
+          // required escalation phrase
+          speak(resp.message);
           if (resp.requestId) {
-            // start/continue waiting for supervisor answer
-            setLastPendingId(resp.requestId);
+            setLastPendingId(resp.requestId); // persists to localStorage via effect
           }
         } else {
           speak("Sorry, something went wrong.");
@@ -172,7 +183,7 @@ export default function VoiceCall() {
         </div>
       )}
       <p style={{ marginTop: 8, color: "#555" }}>
-        Demo: ask an unknown → AI escalates, then resolve it in Supervisor — the AI will speak the follow-up automatically.
+        Demo: ask an unknown → AI escalates, then resolve it in Supervisor — the AI will speak the follow-up automatically (even if you switched tabs).
       </p>
     </div>
   );
