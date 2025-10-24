@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Room, RoomEvent, createLocalAudioTrack } from "livekit-client";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000";
@@ -15,6 +15,10 @@ export default function VoiceCall() {
   const [transcript, setTranscript] = useState("");
   const roomRef = useRef(null);
   const recRef = useRef(null);
+
+  // NEW: track last escalated request to wait for supervisor response
+  const [lastPendingId, setLastPendingId] = useState(null);
+  const pollRef = useRef(null);
 
   async function joinRoom() {
     try {
@@ -36,7 +40,6 @@ export default function VoiceCall() {
         setConnected(false);
       });
 
-      // publish microphone
       const mic = await createLocalAudioTrack();
       await room.localParticipant.publishTrack(mic);
 
@@ -52,8 +55,50 @@ export default function VoiceCall() {
       roomRef.current?.disconnect();
     } finally {
       setConnected(false);
+      setLastPendingId(null);
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
     }
   }
+
+  // NEW: poll for supervisor follow-up on a pending request
+  useEffect(() => {
+    if (!lastPendingId) return;
+    if (pollRef.current) return;
+
+    async function checkFollowup() {
+      try {
+        const resp = await fetch(`${API_BASE}/api/help-requests`).then((r) => r.json());
+        const list = resp.items || [];
+        const item = list.find((it) => it.id === lastPendingId);
+        if (item && item.status === "resolved" && item.answer) {
+          // Speak the supervisor's answer immediately
+          speak(item.answer);
+          setLastPendingId(null);
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+        // If it becomes unresolved, stop polling too
+        if (item && item.status === "unresolved") {
+          setLastPendingId(null);
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+        }
+      } catch (e) {
+        console.error("follow-up poll failed", e);
+      }
+    }
+
+    pollRef.current = setInterval(checkFollowup, 2000);
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, [lastPendingId]);
 
   function startSTT() {
     if (!("webkitSpeechRecognition" in window)) {
@@ -75,12 +120,16 @@ export default function VoiceCall() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ customerId: identity, question: said })
-        }).then(x => x.json());
+        }).then((x) => x.json());
 
         if (resp.status === "answered") {
           speak(resp.answer);
         } else if (resp.status === "escalated") {
-          speak(resp.message);
+          speak(resp.message); // required escalation phrase
+          if (resp.requestId) {
+            // start/continue waiting for supervisor answer
+            setLastPendingId(resp.requestId);
+          }
         } else {
           speak("Sorry, something went wrong.");
         }
@@ -91,7 +140,9 @@ export default function VoiceCall() {
     };
 
     rec.onerror = (e) => console.error("STT error", e);
-    rec.onend = () => { recRef.current = null; };
+    rec.onend = () => {
+      recRef.current = null;
+    };
 
     recRef.current = rec;
     rec.start();
@@ -115,8 +166,13 @@ export default function VoiceCall() {
         <button onClick={startSTT} disabled={!connected}>🎙️ Ask by Voice</button>
       </div>
       <div><b>Last transcript:</b> {transcript || <i>(none)</i>}</div>
+      {lastPendingId && (
+        <div style={{ marginTop: 8, color: "#444" }}>
+          Waiting for supervisor response… (request {lastPendingId.slice(0, 8)})
+        </div>
+      )}
       <p style={{ marginTop: 8, color: "#555" }}>
-        Demo: Join the room → click “Ask by Voice” → say “What are your hours?” (known) or an unknown to trigger escalation, then resolve it in Supervisor and ask again.
+        Demo: ask an unknown → AI escalates, then resolve it in Supervisor — the AI will speak the follow-up automatically.
       </p>
     </div>
   );

@@ -29,10 +29,12 @@ function normalize(text = "") {
 
 function findAnswer(question) {
   const q = normalize(question);
+  // keyword match first
   for (const [k, v] of knowledge.entries()) {
-    if (q.includes(k)) return v;       // keyword match
+    if (q.includes(k)) return v;
   }
-  if (knowledge.has(q)) return knowledge.get(q); // exact match
+  // exact match fallback
+  if (knowledge.has(q)) return knowledge.get(q);
   return null;
 }
 
@@ -55,7 +57,7 @@ app.post("/api/livekit-token", async (req, res) => {
   }
 });
 
-// ---------------------- AI Ask endpoint: HITL core logic ----------------------
+// ---------------------- AI Ask endpoint: HITL core logic (with de-dupe) ----------------------
 app.post("/api/ask", (req, res) => {
   const { customerId = "anon", question = "" } = req.body || {};
   const known = findAnswer(question);
@@ -64,37 +66,64 @@ app.post("/api/ask", (req, res) => {
     return res.json({ status: "answered", answer: known });
   }
 
-  // Unknown → escalate
+  // De-dupe: if same customer asked same normalized question recently and it's still pending, reuse it.
+  const DEDUPE_MS = 60 * 1000; // 60 seconds
+  const now = Date.now();
+  const qNorm = normalize(question);
+
+  let existing = null;
+  for (const item of helpRequests.values()) {
+    if (
+      item.status === "pending" &&
+      item.customerId === customerId &&
+      normalize(item.question) === qNorm &&
+      now - item.createdAt <= DEDUPE_MS
+    ) {
+      existing = item;
+      break;
+    }
+  }
+
+  const escalationLine = "Let me check with my supervisor and get back to you.";
+
+  if (existing) {
+    // don't notify supervisor again; just return same requestId
+    return res.json({
+      status: "escalated",
+      requestId: existing.id,
+      message: escalationLine,
+      deduped: true
+    });
+  }
+
+  // Unknown → create a new pending request
   const id = uuid();
   const item = {
     id,
     customerId,
     question,
     status: "pending",
-    createdAt: Date.now()
+    createdAt: now
   };
   helpRequests.set(id, item);
 
   // Simulated "text to supervisor"
   console.log(`[Notify Supervisor] Hey, I need help answering: "${question}" (id: ${id})`);
 
-  // Required phrase from the PDF
-  const escalationLine = "Let me check with my supervisor and get back to you.";
-
   return res.json({
     status: "escalated",
     requestId: id,
-    message: escalationLine
+    message: escalationLine,
+    deduped: false
   });
 });
 
-// List requests (supervisor dashboard)
+// ---------------------------- Supervisor dashboard APIs ----------------------------
 app.get("/api/help-requests", (_req, res) => {
   const items = Array.from(helpRequests.values()).sort((a, b) => b.createdAt - a.createdAt);
   res.json({ items });
 });
 
-// Supervisor resolves / marks unresolved
 app.patch("/api/help-requests/:id", (req, res) => {
   const item = helpRequests.get(req.params.id);
   if (!item) return res.status(404).json({ error: "not_found" });
@@ -106,10 +135,10 @@ app.patch("/api/help-requests/:id", (req, res) => {
     item.resolvedAt = Date.now();
     helpRequests.set(item.id, item);
 
-    // Learn
+    // Learn (upsert into KB)
     knowledge.set(normalize(item.question), answer);
 
-    // Immediate follow-up (frontend will do TTS)
+    // Immediate follow-up (frontend will TTS; we log to show it happened)
     console.log(`[AI Follow-up -> ${item.customerId}] ${answer}`);
   } else if (status === "unresolved") {
     item.status = "unresolved";
@@ -119,13 +148,13 @@ app.patch("/api/help-requests/:id", (req, res) => {
   res.json(item);
 });
 
-// Learned answers
 app.get("/api/knowledge", (_req, res) => {
   const items = Array.from(knowledge.entries()).map(([q, a]) => ({ question: q, answer: a }));
   res.json({ items });
 });
 
-// Timeout worker: mark pending > 10m as unresolved
+// ---------------------------- Timeout worker ----------------------------
+// Mark pending > 10 minutes as unresolved
 setInterval(() => {
   const now = Date.now();
   const TEN_MIN = 10 * 60 * 1000;
