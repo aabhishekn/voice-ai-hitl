@@ -1,8 +1,8 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { v4 as uuid } from "uuid";
 import { AccessToken } from "livekit-server-sdk";
+import { db } from "./firebase.js";
 
 dotenv.config();
 
@@ -15,26 +15,32 @@ const LIVEKIT_URL = process.env.LIVEKIT_URL;
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 
-// ---------------- In-memory stores (swap to Firestore/Mongo later) ----------------
-const knowledge = new Map([
-  ["what are your hours", "We’re open 9 AM – 6 PM, Monday through Saturday."],
-  ["where are you located", "We’re at 123 Main Street, near Central Plaza."]
-]);
+if (!db) {
+  console.warn("[server] Firestore not initialized. Check FIREBASE_SERVICE_ACCOUNT_JSON in backend/.env");
+}
 
-const helpRequests = new Map(); // id -> object
-
+// ---------------- Helpers ----------------
 function normalize(text = "") {
   return text.toLowerCase().trim();
 }
 
-function findAnswer(question) {
+const HELP_REQS = db ? db.collection("help_requests") : null;
+const KB = db ? db.collection("knowledge") : null;
+
+async function kbFindAnswer(question) {
+  if (!db) return null;
   const q = normalize(question);
-  // keyword match first
-  for (const [k, v] of knowledge.entries()) {
-    if (q.includes(k)) return v;
+
+  // exact match first (KB doc id = normalized question)
+  const exact = await KB.doc(q).get();
+  if (exact.exists) return exact.data().answer;
+
+  // fallback: simple keyword containment scan (fine for demo size)
+  const snap = await KB.limit(500).get();
+  for (const doc of snap.docs) {
+    const key = doc.id;
+    if (q.includes(key)) return doc.data().answer;
   }
-  // exact match fallback
-  if (knowledge.has(q)) return knowledge.get(q);
   return null;
 }
 
@@ -57,37 +63,41 @@ app.post("/api/livekit-token", async (req, res) => {
   }
 });
 
-// ---------------------- AI Ask endpoint: HITL core logic (with de-dupe) ----------------------
-app.post("/api/ask", (req, res) => {
-  const { customerId = "anon", question = "" } = req.body || {};
-  const known = findAnswer(question);
+// ---------------------- AI Ask endpoint: Firestore + de-dupe ----------------------
+app.post("/api/ask", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "firestore_not_initialized" });
 
+  const { customerId = "anon", question = "" } = req.body || {};
+
+  // 1) Try knowledge base
+  const known = await kbFindAnswer(question);
   if (known) {
     return res.json({ status: "answered", answer: known });
   }
 
-  // De-dupe: if same customer asked same normalized question recently and it's still pending, reuse it.
-  const DEDUPE_MS = 60 * 1000; // 60 seconds
+  // 2) De-dupe: same customer + same normalized question, pending, created within 60s
+  const DEDUPE_MS = 60 * 1000;
   const now = Date.now();
   const qNorm = normalize(question);
 
+  const dupSnap = await HELP_REQS
+    .where("customerId", "==", customerId)
+    .where("status", "==", "pending")
+    .orderBy("createdAt", "desc")
+    .limit(5)
+    .get();
+
   let existing = null;
-  for (const item of helpRequests.values()) {
-    if (
-      item.status === "pending" &&
-      item.customerId === customerId &&
-      normalize(item.question) === qNorm &&
-      now - item.createdAt <= DEDUPE_MS
-    ) {
-      existing = item;
-      break;
+  dupSnap.forEach(d => {
+    const it = d.data();
+    if (normalize(it.question) === qNorm && now - it.createdAt <= DEDUPE_MS) {
+      existing = { id: d.id, ...it };
     }
-  }
+  });
 
   const escalationLine = "Let me check with my supervisor and get back to you.";
 
   if (existing) {
-    // don't notify supervisor again; just return same requestId
     return res.json({
       status: "escalated",
       requestId: existing.id,
@@ -96,74 +106,100 @@ app.post("/api/ask", (req, res) => {
     });
   }
 
-  // Unknown → create a new pending request
-  const id = uuid();
-  const item = {
-    id,
+  // 3) Create new pending request
+  const docRef = await HELP_REQS.add({
     customerId,
     question,
     status: "pending",
     createdAt: now
-  };
-  helpRequests.set(id, item);
+  });
 
-  // Simulated "text to supervisor"
-  console.log(`[Notify Supervisor] Hey, I need help answering: "${question}" (id: ${id})`);
+  console.log(`[Notify Supervisor] Hey, I need help answering: "${question}" (id: ${docRef.id})`);
 
   return res.json({
     status: "escalated",
-    requestId: id,
+    requestId: docRef.id,
     message: escalationLine,
     deduped: false
   });
 });
 
 // ---------------------------- Supervisor dashboard APIs ----------------------------
-app.get("/api/help-requests", (_req, res) => {
-  const items = Array.from(helpRequests.values()).sort((a, b) => b.createdAt - a.createdAt);
+app.get("/api/help-requests", async (_req, res) => {
+  if (!db) return res.json({ items: [] });
+
+  const snap = await HELP_REQS.orderBy("createdAt", "desc").limit(200).get();
+  const items = snap.docs.map(d => ({ id: d.id, ...d.data() }));
   res.json({ items });
 });
 
-app.patch("/api/help-requests/:id", (req, res) => {
-  const item = helpRequests.get(req.params.id);
-  if (!item) return res.status(404).json({ error: "not_found" });
+app.patch("/api/help-requests/:id", async (req, res) => {
+  if (!db) return res.status(500).json({ error: "firestore_not_initialized" });
 
+  const ref = HELP_REQS.doc(req.params.id);
+  const doc = await ref.get();
+  if (!doc.exists) return res.status(404).json({ error: "not_found" });
+
+  const data = doc.data();
   const { answer, status } = req.body || {};
+
   if (answer) {
-    item.answer = answer;
-    item.status = "resolved";
-    item.resolvedAt = Date.now();
-    helpRequests.set(item.id, item);
+    const resolvedAt = Date.now();
+    await ref.update({ answer, status: "resolved", resolvedAt });
 
-    // Learn (upsert into KB)
-    knowledge.set(normalize(item.question), answer);
+    // Learn (upsert into Knowledge by normalized question)
+    const key = normalize(data.question);
+    await KB.doc(key).set({ answer, updatedAt: resolvedAt }, { merge: true });
 
-    // Immediate follow-up (frontend will TTS; we log to show it happened)
-    console.log(`[AI Follow-up -> ${item.customerId}] ${answer}`);
-  } else if (status === "unresolved") {
-    item.status = "unresolved";
-    helpRequests.set(item.id, item);
+    // Immediate follow-up (frontend polls; we log for visibility)
+    console.log(`[AI Follow-up -> ${data.customerId}] ${answer}`);
+
+    const updated = (await ref.get()).data();
+    return res.json({ id: ref.id, ...updated });
   }
 
-  res.json(item);
+  if (status === "unresolved") {
+    await ref.update({ status: "unresolved" });
+    const updated = (await ref.get()).data();
+    return res.json({ id: ref.id, ...updated });
+  }
+
+  // No change: return current
+  return res.json({ id: ref.id, ...data });
 });
 
-app.get("/api/knowledge", (_req, res) => {
-  const items = Array.from(knowledge.entries()).map(([q, a]) => ({ question: q, answer: a }));
+app.get("/api/knowledge", async (_req, res) => {
+  if (!db) return res.json({ items: [] });
+
+  const snap = await KB.limit(500).get();
+  const items = snap.docs.map(d => ({ question: d.id, answer: d.data().answer }));
   res.json({ items });
 });
 
 // ---------------------------- Timeout worker ----------------------------
 // Mark pending > 10 minutes as unresolved
-setInterval(() => {
-  const now = Date.now();
-  const TEN_MIN = 10 * 60 * 1000;
-  for (const item of helpRequests.values()) {
-    if (item.status === "pending" && now - item.createdAt > TEN_MIN) {
-      item.status = "unresolved";
-      helpRequests.set(item.id, item);
-      console.log(`[Timeout] Request ${item.id} marked unresolved`);
-    }
+setInterval(async () => {
+  if (!db) return;
+  try {
+    const now = Date.now();
+    const TEN_MIN = 10 * 60 * 1000;
+
+    const snap = await HELP_REQS.where("status", "==", "pending").get();
+
+    const batch = db.batch();
+    let updates = 0;
+    snap.forEach(doc => {
+      const it = doc.data();
+      if (now - it.createdAt > TEN_MIN) {
+        batch.update(doc.ref, { status: "unresolved" });
+        updates++;
+        console.log(`[Timeout] Request ${doc.id} marked unresolved`);
+      }
+    });
+
+    if (updates > 0) await batch.commit();
+  } catch (e) {
+    console.error("[timeout worker] error", e);
   }
 }, 30 * 1000);
 
