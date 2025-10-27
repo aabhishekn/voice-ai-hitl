@@ -4,6 +4,14 @@ import dotenv from "dotenv";
 import { AccessToken } from "livekit-server-sdk";
 import { db } from "./firebase.js";
 
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
+
+
 dotenv.config();
 
 const app = express();
